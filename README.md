@@ -14,7 +14,13 @@ Two things live here:
 ```sh
 make            # builds selfContained + selfHosted + the toy C compiler
 make check      # runs the reproductions below
+make m1         # builds the corrected assembler from fixed/
+make golden     # byte-compares its output against GNU as
 ```
+
+**M1 is done** — `fixed/selfContained.asm` assembles its documented subset
+correctly, and its output is byte-for-byte identical to binutils. See
+[section 6](#6-m1--the-corrected-assembler).
 
 ---
 
@@ -333,3 +339,90 @@ ld  -o selfContained selfContained.o
 ```
 
 It is a build aid, not a general NASM implementation.
+
+---
+
+## 6. M1 — the corrected assembler
+
+`fixed/selfContained.asm` is `selfContained.asm` with every fault from section 2.1
+fixed. `fixed/selfContained.patch` is the same change as a unified diff, ready to
+apply upstream:
+
+```sh
+cd SelfHostedAssembler
+patch -p1 < selfContained.patch
+```
+
+### 6.1 Result
+
+```
+$ make golden
+  bytes: 153, identical to GNU as
+PASS golden1: byte-identical to GNU as, runs, exits 42
+  bytes: 160, identical to GNU as
+PASS golden2: byte-identical to GNU as, runs, exits 55
+PASS regression: 'mov rax, 60' assembles (used to error)
+PASS regression: 'call foo' assembles (used to segfault)
+PASS regression: s/r lines reach the dispatcher (shl reported, not dropped)
+```
+
+`golden1` prints `hello from mini-asm` and exits 42. `golden2` sums 1..10 through
+a backward loop and exits 55. Both cover `mov reg,imm` / `mov reg,reg`, `add`,
+`sub`, `cmp`, `xor`, `and`, `jmp`, `je`, `jne`, `jl`, `jg`, `call`, `ret`,
+`syscall`, `db` with strings and numbers, forward and backward label references,
+nested calls, and all eight encodable registers.
+
+### 6.2 Why byte-comparison and not just "does it run"
+
+A program that runs proves the paths it happens to take. It does not prove the
+encoder. Each golden test therefore assembles the same source twice — once with
+mini-asm, once with `as` + `ld` — and requires the two byte streams to match
+exactly.
+
+One wrinkle: mini-asm always encodes branches as `rel32`, while GAS relaxes short
+ones to `rel8`. Both are correct; they are just different choices. The reference
+build passes `--long-jumps` to `nasm2gas.py`, which emits `jmp.d32` / `je.d32` so
+that both assemblers make the same choice and the comparison stays meaningful.
+
+### 6.3 What changed
+
+| # | Fault | Fix |
+|---|---|---|
+| a | `call emit_byte` followed by a bare `db 0xNN`, which executed as a prefix instead of being emitted (10 sites) | `mov rdi, 0xNN` then `call emit_byte` |
+| b | `is_register`'s eight `ret`s were all commented out by `;`, so `.r0` fell through to `is_number` | each `ret` on its own line |
+| c | `parse_instruction` advanced `r13` per letter then always subtracted 4 | new `word_key` builds the lookup key without moving `r13`; the mnemonic is consumed exactly once |
+| d | `parse_alu` wrote a register index into `r13`, the input read pointer | parser scratch moved to `r12`/`r15`/`rbp`; a register contract is documented at the top of the file |
+| e | `parse_mov` counted 7 bytes for `mov reg,reg`, which emits 3 | each operand form advances `pc_vaddr` by its true size |
+| f | `parse_alu` used `r14`, the input end pointer, to hold the opcode | opcode held in `rbp` |
+| g | any line starting with `s`, `g`, `e` or `r` was discarded, taking `sub`, `syscall`, `ret`, `shl`, `shr` with it | directives matched as whole words against a `directive_table` |
+| h | `find_symbol` clobbered `rcx`, the token length, before `parse_mov` called `is_number` | loop scratch moved to `r10` |
+| i | symbol lookup compared hashes only | entries store the name length too, and both must match |
+| j | no symbol table bounds check (`4096/24` = 170 entries, comment claimed 256) | `sym_max` check with a clear error |
+| k | an unrecognised line was silently skipped | reported as `Error: unknown mnemonic: xxxx` |
+| l | `name db ...` was not handled | defines the symbol at the current address, then emits the bytes |
+| m | `db` could not hold a string containing a space or comma | strings scanned directly off the read pointer |
+| n | a parser stopping mid-line left the rest to be parsed as another instruction | `.is_instr` skips to end of line |
+
+### 6.4 Behaviour on the original `selfHosted.asm`
+
+```
+$ ./fixed          # input is selfHosted.asm
+Error: unknown mnemonic: test
+```
+
+Previously this hung forever. It now names the first instruction it cannot
+encode, which is exactly the M2 work list: `test`, `lea`, `push`, `pop`,
+`movzx`, `inc`, `dec`, `or`, `imul`, `mul`, `rep`, and the `jb`/`ja`/`jbe`/`jge`
+family, plus memory operands and 8-bit registers.
+
+### 6.5 Not in M1
+
+Deliberately out of scope, and still true of `fixed/`:
+
+- No memory operands, no 8-bit registers, no `push`/`pop`/`lea`/`test`. That is M2.
+- Labels are global; NASM's `.local` scoping is not implemented.
+- `mov reg, imm` takes a 32-bit immediate only.
+- Symbols are matched on a DJB2 hash plus length, not the full name.
+- Everything is emitted into one flat `PT_LOAD`; there is no `.data`/`.bss`
+  separation. That is M3.
+- It still cannot assemble its own source — that needs M2 first.

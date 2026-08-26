@@ -48,3 +48,20 @@ clean:
 	rm -rf $(BUILD)
 
 .PRECIOUS: $(BUILD)/%.s
+
+# ---- M1: the corrected assembler in fixed/ ----------------------------------
+.PHONY: m1 golden
+
+$(BUILD)/fixed.s: fixed/selfContained.asm tools/nasm2gas.py | $(BUILD)
+	$(PY) tools/nasm2gas.py $< > $@
+
+$(BUILD)/fixed.o: $(BUILD)/fixed.s
+	$(AS) --64 -o $@ $<
+
+$(BUILD)/fixed: $(BUILD)/fixed.o
+	$(LD) -o $@ $<
+
+m1: $(BUILD)/fixed
+
+golden: $(BUILD)/fixed
+	@sh tests/golden.sh $(abspath $(BUILD))

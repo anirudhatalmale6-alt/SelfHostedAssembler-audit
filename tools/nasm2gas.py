@@ -12,6 +12,8 @@ stays a bug in the binary.
 import re
 import sys
 
+LONG_JUMPS = False
+
 SIZE_KW = ("byte", "word", "dword", "qword")
 
 
@@ -184,6 +186,12 @@ def main(path):
 
         # ordinary instruction
         s = add_ptr(char_consts(s))
+        # mini-asm always encodes branches as rel32. GAS relaxes short ones to
+        # rel8, which is equally correct but produces different bytes, so the
+        # golden comparison asks GAS for the long form explicitly.
+        if LONG_JUMPS:
+            s = re.sub(r"^(jmp|je|jne|jl|jg|jle|jge|jz|jnz)\s+",
+                       r"\1.d32 ", s, flags=re.I)
         # NASM `mov rdi, in_path` means the ADDRESS; GAS Intel syntax reads a
         # bare symbol as memory contents, so an explicit `offset` is required.
         # Branch targets and anything already inside [] must be left alone.
@@ -202,4 +210,6 @@ def main(path):
 
 
 if __name__ == "__main__":
-    sys.stdout.write(main(sys.argv[1]))
+    argv = [a for a in sys.argv[1:] if a != "--long-jumps"]
+    LONG_JUMPS = "--long-jumps" in sys.argv
+    sys.stdout.write(main(argv[0]))
