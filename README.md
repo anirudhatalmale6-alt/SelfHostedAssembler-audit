@@ -1,0 +1,335 @@
+# SelfHostedAssembler — build harness + audit
+
+Companion to [`netpipe/SelfHostedAssembler`](https://github.com/netpipe/SelfHostedAssembler).
+
+Two things live here:
+
+1. **`tools/nasm2gas.py`** — a translator for the NASM subset those `.asm` files
+   use, so both assemblers can be **built and run with plain binutils** (`as` +
+   `ld`), no NASM needed. It is deliberately faithful: it fixes nothing, so a
+   bug in the `.asm` is still a bug in the binary.
+2. **This document** — what happens when you actually run them, and why the
+   answer to *"can we compile `nano_cc` with this?"* is **not yet**.
+
+```sh
+make            # builds selfContained + selfHosted + the toy C compiler
+make check      # runs the reproductions below
+```
+
+---
+
+## TL;DR
+
+| Component | State | Can it build `nano_cc`? |
+|---|---|---|
+| `selfContained.asm` | Runs. Fails on the first instruction of its own documented subset. | No |
+| `selfHosted.asm` | Does not assemble — jumps to a label that is never defined. Under that, the encoders are labelled placeholders that emit no bytes. | No |
+| `c-compiler/compiler.c` | Emits syntactically invalid NASM; `*` and `/` return 0. | No |
+| `shlr-patch/*` | Adds `shl`/`shr` table entries, but on top of the above. | No |
+
+Applying the shl/shr patch is not the blocker. Each of the three components
+fails well before shifts matter.
+
+---
+
+## 1. Reproductions
+
+Built from a clean checkout, no edits to any `.asm` or `.c`.
+
+### 1.0 `selfHosted.asm` does not assemble
+
+```
+ld: selfHosted.o: in function `process_line':
+    undefined reference to `process_line.done_line'
+```
+
+Line 168 is `je .done_line`, and `.done_line` is never defined anywhere in the
+file — the label the author meant is `.next_line` or `.done`. NASM rejects this
+for the same reason. So `selfHosted.asm` has never been built in its current
+state.
+
+### 1.1 `selfContained` cannot assemble `mov rax, 60`
+
+```
+$ cat selfHosted.asm
+_start:
+mov rax, 60
+xor rdi, rdi
+syscall
+
+$ ./selfContained
+Error:
+$ echo $?
+1
+$ ls a.out
+ls: cannot access 'a.out': No such file or directory
+```
+
+`mov r64, imm32` is the very first form in its own opcode table.
+
+### 1.2 A 4-letter mnemonic segfaults
+
+```
+$ printf 'foo:\ncall foo\n' > selfHosted.asm
+$ ./selfContained
+Segmentation fault (core dumped)
+```
+
+### 1.3 Fed its own intended input, it hangs
+
+```
+$ cp ../selfHosted.asm . && timeout 5 ./selfContained
+$ echo $?
+124            # timed out — infinite loop
+```
+
+### 1.4 The toy C compiler emits invalid assembly and wrong arithmetic
+
+```
+$ printf 'x = 2 + 3 * 4;\ny = x - 1;\n' | ./cc_boot
+...
+mov rax, 4
+mov rcx, [rsp]
+add rsp, 8
+mov rax, rcx
+mov rax, 0          <-- 3 * 4 evaluated to 0
+...
+mov [vars + 0]      <-- no source operand; not valid NASM
+mov rax, mov [vars + 16]   <-- two mnemonics on one line
+```
+
+`x` is stored at `vars+0` and read back from `vars+16`. `2 + 3*4` compiles to
+the value `2`.
+
+---
+
+## 2. Root causes
+
+### 2.1 `selfContained.asm`
+
+**(a) `call emit_byte` followed by a raw `db` — 10 of the 17 emit sites.**
+
+```asm
+    call emit_byte
+    db 0x48            ; intended: "now emit a REX.W byte"
+    mov rdi, r14
+    call emit_byte
+```
+
+`db 0x48` is not data here — it is planted in the middle of the instruction
+stream and *executes*. Disassembling the linked binary:
+
+```
+ 406:   call   7d1 <emit_byte>
+ 40b:   rex.W                     <-- the 0x48, now a prefix on the next insn
+ 40c:   mov    %r14,%rdi
+ 40f:   call   7d1 <emit_byte>
+```
+
+So the REX.W byte is never written to the output, and the first `emit_byte`
+call runs with whatever `rdi` happened to hold. Every encoded instruction gets
+a garbage first byte. The intent was `mov rdi, 0x48` / `call emit_byte`.
+Affects `parse_alu`, `parse_mov` (both paths), `parse_jcc`, `parse_call`,
+`parse_ret`, `parse_sys`.
+
+**(b) `is_register` never returns — all eight `ret`s are commented out.**
+
+```asm
+.r0: mov eax, 0 ; ret
+.r1: mov eax, 1 ; ret
+...
+.r7: mov eax, 7 ; ret
+```
+
+The `;` makes `ret` a comment, so `.r0` falls into `.r1` … into `.r7`, and
+`.r7` falls straight into the next function, `is_number`. Confirmed by
+disassembly — there is no `ret` anywhere between `.r0` and `is_number`. Every
+register name resolves to the same value.
+
+**(c) `parse_instruction` mis-restores the read pointer.**
+
+```asm
+.copy_loop:  ...  inc r13  ...      ; advances r13 once per *letter* copied
+.done_copy:
+    sub r13, 4                      ; always subtracts 4
+```
+
+For a 3-letter mnemonic (`mov`, `add`, `xor`, `jmp`) `r13` advanced by 3 but 4
+is subtracted, so `r13` ends up one byte *before* the mnemonic — on the
+previous newline. The `.skip_mnem` loop then stops immediately, the mnemonic is
+never consumed, and `get_token` returns `"mov"` as the first operand.
+`is_register("mov")` fails → `error_exit`. **This is the failure in 1.1.**
+
+**(d) `parse_alu` and the shl/shr patch overwrite `r13`, the input pointer.**
+
+```asm
+    call is_register
+    mov r13, rax        ; r13 is the source read pointer!
+```
+
+Once a register index (0-7) lands in `r13`, the next `process_line` dereferences
+a near-null pointer. **This is the segfault in 1.2.**
+
+**(e) `pc_vaddr` and `out_ptr` disagree.** `parse_mov`'s reg,reg path emits 3
+bytes but advances `pc_vaddr` by 7. Every label address computed after the first
+`mov r64, r64` is wrong, so every `jmp`/`je`/`call` displacement is wrong.
+
+**(f) Any line whose first character is `s`, `g`, `e` or `r` is discarded.**
+
+```asm
+    cmp al, 's'  ; section
+    je .skip_to_nl
+    cmp al, 'g'  ; global
+    je .skip_to_nl
+    cmp al, 'e'  ; extern/equ
+    je .skip_to_nl
+    cmp al, 'r'  ; resb/resq
+    je .skip_to_nl
+```
+
+That check runs on the first non-whitespace character of the line, which for an
+indented instruction is the first letter of the *mnemonic*. So `sub`, `syscall`,
+`ret` — and `shl`/`shr`, the whole point of the patch — are silently dropped.
+The directive test needs to match the whole word, not one character.
+
+**(g) The symbol table holds 170 entries (`4096 / 24`), not the 256 the comment
+claims, and there is no overflow check.**
+
+### 2.2 `selfHosted.asm`
+
+It does not assemble at all: `process_line` contains `je .done_line` for a label
+that does not exist (1.0). Once that is corrected, the encoders are placeholders,
+as the file itself says:
+
+```asm
+; Placeholder emitters to satisfy structure.
+emit_modrm_prefix:
+    add qword [pc_vaddr], 3
+    ret
+emit_alu_op:
+    add qword [pc_vaddr], 3
+    ret
+emit_jump:
+    add qword [pc_vaddr], 5
+    ret
+```
+
+Nothing is ever written to `out_buf` except the `ret` opcode, so its `a.out` is
+an ELF header plus a handful of `0xC3` bytes. Additionally `is_label` does
+`mul rcx` with the *hash* in `rax` instead of the symbol count, producing a wild
+`sym_tbl` pointer.
+
+The shl/shr patch for this file adds
+
+```asm
+parse_shift:
+    add qword [pc_vaddr], 4
+    jmp end_instr
+```
+
+which reserves 4 bytes and emits none — consistent with the other stubs, but it
+adds no capability. It also dispatches on `'s'` inside `is_instr`, which is
+unreachable because `process_line` already discarded every `s…` line (2.1f).
+
+### 2.3 `c-compiler/compiler.c`
+
+- `find_var` is broken: `var_start[id] = var_len[id] = 0;` zeroes the name slot,
+  the name is then written at `var_names[var_count * 64 + k]` (`var_count` was
+  already incremented, so it lands one slot too far), and lookups compare
+  against `var_names[var_start[i] + k]` where `var_start[i]` is always 0. Every
+  reference to an existing variable allocates a *new* one — hence store at
+  `vars+0`, load from `vars+16`.
+- Assignment emits `STR_MOV_VARS` with no source operand, so `mov [vars + 0]`.
+- Variable loads emit `STR_MOV_RAX` *and* `STR_MOV_VARS`, so
+  `mov rax, mov [vars + 16]`.
+- `*` and `/` are stubs that emit `mov rax, 0`.
+- No `if`, `while`, function definitions, `print`, pointers, arrays or strings —
+  the parser handles `name = expr;` and blocks only. It cannot compile itself,
+  and `bootstrap.c` needs a real C compiler regardless.
+
+The shl/shr patch replaces the `*`/`/` stubs with shift sequences for
+`v ∈ {0,1,2,3,4,5,8,10}` on multiply and `{1,2,4,8}` on divide, and keeps
+`mov rax, 0` for every other constant and for *all* non-constant operands. So
+`a * 6` and `a * b` still silently produce 0. `last_was_const` is also never
+cleared by the `(` branch of `factor()`, so a parenthesised sub-expression
+inherits a stale constant from inside it.
+
+---
+
+## 3. Can `nano_cc` be compiled by this?
+
+Three independent gaps, in increasing size:
+
+**(a) Nothing here can compile C.** `compiler.c` handles `name = expr;`.
+`nano_cc` is 1489 lines using `calloc`, `fopen`, `fprintf`, `strcmp`,
+`va_list`, structs, pointers, arrays and function pointers. That is not a patch;
+it is a different program.
+
+**(b) The assembler cannot assemble `nano_cc`'s *output* either.** Across the
+six demo programs, `nano_cc` emits **31 distinct mnemonics**:
+
+```
+mov push lea pop call xor add ret leave jmp test jz sub cmp movsx movzx
+sete setg idiv cqo setl neg je syscall and shl or setle sar not jnz imul
+```
+
+The assembler's table has 14 entries and supports only `reg,reg`, `reg,imm` and
+`label` operands. **No memory operand form exists at all** — and 2138 of the
+emitted instructions are `mov`, the overwhelming majority of them to or from
+memory (`mov [rbp-8], rax`). `push`/`pop`/`lea`/`leave`/`idiv`/`imul`/`cqo`/
+`movsx`/`movzx`/`setcc` are all absent too.
+
+**(c) Neither assembler can assemble its own source.** By its own supported
+list, `selfContained.asm` uses **19 mnemonics it does not support**, in 101 of
+its 532 instructions (`push`, `pop`, `lea`, `test`, `movzx`, `imul`, `mul`,
+`inc`, `dec`, `or`, `rep`, `js`, `jz`, `jnz`, `jb`, `ja`, `jbe`, `jge`, `shl`)
+— plus 8-bit registers, memory operands, `dw`/`dd`/`dq`, `equ`, `align` and
+`section`. `selfHosted.asm` uses 10 unsupported mnemonics in 25 of its 194
+instructions. The "self-hosting" property does not hold in either file today.
+
+---
+
+## 4. What a working path looks like
+
+Roughly in dependency order. Each step is independently testable.
+
+1. **Make `selfContained` correct for the subset it already claims.** Fix
+   2.1(a)–(g). Add a golden test: assemble a small program, compare the emitted
+   bytes against `as`/`objdump` output for the same source. This is the
+   foundation — everything else is worthless without it.
+2. **Widen the encoder** to memory operands (`[reg]`, `[reg+disp]`,
+   `[label]`), 8-bit registers, `push`/`pop`/`lea`/`test`/`inc`/`dec`/`neg`/
+   `not`/`shl`/`shr`/`sar`/`or`, `movzx`/`movsx`, `setcc`, `imul`/`idiv`/`cqo`,
+   `leave`, and the full `jcc` set. This is what it takes to accept
+   `nano_cc`-shaped output.
+3. **Add `.bss`/`.data` sections and 64-bit immediates** so real programs, not
+   just single code blobs, can be produced.
+4. **Teach `nano_cc` a `-masm=nasm` output mode.** Its backend already emits
+   Intel syntax; switching `.intel_syntax noprefix` / `.zero` / `.quad` to NASM
+   `section` / `resb` / `dq` is a contained change. That gets
+   `nano_cc program.c | selfContained` working end to end.
+5. **Only then** is "assemble `nano_cc`'s own output with `selfContained`"
+   reachable — and it needs step 2 finished, because `nano_cc`'s output uses
+   every form listed there.
+
+Compiling `nano_cc`'s *source* with `c-compiler/compiler.c` is not on this path
+and I would not recommend attempting it; `nano_cc` already is the C compiler.
+
+---
+
+## 5. `tools/nasm2gas.py`
+
+Handles what these files use: `section` / `global` / `equ` / `align`,
+`db`/`dw`/`dd`/`dq` (including string operands), `resb`/`resq`, NASM local
+labels (`.loop` → `owner__loop`), NASM character constants (`'rax'` → the packed
+integer), `byte [x]` → `byte ptr [x]`, and bare-symbol operands → `offset sym`
+(GAS Intel syntax reads a bare symbol as memory contents; NASM reads it as the
+address — that difference alone silently breaks every `mov rdi, in_path`).
+
+```sh
+python3 tools/nasm2gas.py selfContained.asm > selfContained.s
+as --64 -o selfContained.o selfContained.s
+ld  -o selfContained selfContained.o
+```
+
+It is a build aid, not a general NASM implementation.
