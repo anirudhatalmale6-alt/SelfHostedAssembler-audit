@@ -20,7 +20,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FAIL=0
 
 # name:expected exit code
-CASES="golden1:42 golden2:55 golden3:42 golden4:0 subset:42 golden5:42"
+CASES="golden1:42 golden2:55 golden3:42 golden4:0 subset:42 golden5:42 golden6:42"
 
 for c in $CASES; do
     name=${c%%:*}

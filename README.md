@@ -492,8 +492,14 @@ PASS golden1: byte-identical to GNU as, runs, exits 42
 PASS golden2: byte-identical to GNU as, runs, exits 55
   bytes: 194, identical to GNU as
 PASS golden3: byte-identical to GNU as, runs, exits 42
-  bytes: 935, identical to GNU as
+  bytes: 1013, identical to GNU as
 PASS golden4: byte-identical to GNU as, runs, exits 0
+  bytes: 311, identical to GNU as
+PASS subset: byte-identical to GNU as, runs, exits 42
+  bytes: 208, identical to GNU as
+PASS golden5: byte-identical to GNU as, runs, exits 42
+  bytes: 388, identical to GNU as
+PASS golden6: byte-identical to GNU as, runs, exits 42
 PASS regression: 'mov rax, 60' assembles (used to error)
 PASS regression: 'call foo' assembles (used to segfault)
 PASS regression: s/r lines assemble (sub, shl, shr, syscall, ret)
@@ -506,6 +512,25 @@ rest exists only to be byte-compared: all sixteen registers as both operand and
 memory base, every displacement class, all six ALU ops in all three directions,
 all three shifts in all three forms, every conditional branch, and RIP-relative
 loads and stores.
+
+`golden6` covers 64-bit immediates, and it is worth explaining why it needed
+to exist. `mov reg, imm32` **sign-extends** its 32-bit field to 64 bits, so an
+immediate outside -2^31 .. 2^31-1 cannot use that form — the processor would
+load a different number than the source asked for. The assembler emitted the
+short form unconditionally:
+
+```
+mov rax, 2147483648
+  mini-asm  48 c7 c0 00 00 00 80              -> rax = -2147483648
+  GNU as    48 b8 00 00 00 80 00 00 00 00     -> rax =  2147483648
+```
+
+Nothing about that fails loudly. The program assembles, links and runs; it
+simply computes with the wrong number. It surfaced when a C program printed
+`2147483648` as `-2147483648` after going through this assembler. The fix adds
+the 10-byte `REX.W B8+rd io` form and — just as importantly — keeps choosing
+the 7-byte form whenever the value fits, because binutils does, and this test
+is a byte comparison against binutils.
 
 ### 7.3 Encoding corners that the coverage test exists to catch
 
