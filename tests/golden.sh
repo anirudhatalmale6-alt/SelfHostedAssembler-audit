@@ -20,7 +20,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FAIL=0
 
 # name:expected exit code
-CASES="golden1:42 golden2:55"
+CASES="golden1:42 golden2:55 golden3:42 golden4:0"
 
 for c in $CASES; do
     name=${c%%:*}
@@ -94,12 +94,23 @@ printf 'foo:\ncall foo\nret\n' > "$work/selfHosted.asm"
 [ $? -eq 0 ] && echo "PASS regression: 'call foo' assembles (used to segfault)" \
              || { echo "FAIL regression: call foo"; FAIL=1; }
 
-printf '_start:\nsub rax, rax\nsyscall\nret\nshl rax, 1\n' > "$work/selfHosted.asm"
-( cd "$work" && timeout 10 ./mini_asm ) 2>"$work/e"
-if grep -q "unknown mnemonic" "$work/e"; then
-    echo "PASS regression: s/r lines reach the dispatcher (shl reported, not dropped)"
+# sub/syscall/ret/shl/shr all start with a letter the original threw away.
+printf '_start:\nsub rax, rax\nshl rax, 2\nshr rax, 1\nsyscall\nret\n' > "$work/selfHosted.asm"
+( cd "$work" && rm -f a.out && timeout 10 ./mini_asm ) 2>/dev/null
+if [ -f "$work/a.out" ] && [ "$(wc -c < "$work/a.out")" -gt 120 ]; then
+    echo "PASS regression: s/r lines assemble (sub, shl, shr, syscall, ret)"
 else
     echo "FAIL regression: lines starting with s/r are still being skipped"
+    FAIL=1
+fi
+
+# a genuinely unknown mnemonic must still be reported, not silently dropped
+printf '_start:\nsqrtps xmm0, xmm1\nret\n' > "$work/selfHosted.asm"
+( cd "$work" && timeout 10 ./mini_asm ) 2>"$work/e"
+if grep -q "unknown mnemonic" "$work/e"; then
+    echo "PASS regression: an unknown mnemonic is reported, not skipped"
+else
+    echo "FAIL regression: unknown mnemonic was silently swallowed"
     FAIL=1
 fi
 rm -rf "$work"

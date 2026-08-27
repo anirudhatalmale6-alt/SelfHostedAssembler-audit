@@ -18,9 +18,10 @@ make m1         # builds the corrected assembler from fixed/
 make golden     # byte-compares its output against GNU as
 ```
 
-**M1 is done** — `fixed/selfContained.asm` assembles its documented subset
-correctly, and its output is byte-for-byte identical to binutils. See
-[section 6](#6-m1--the-corrected-assembler).
+**M1 and A2 are done** — `fixed/selfContained.asm` assembles its documented subset
+correctly, now including memory operands, r8-r15 and shifts, and its output is
+byte-for-byte identical to binutils. See [section 6](#6-m1--the-corrected-assembler)
+and [section 7](#7-a2--memory-operands-extended-registers-shifts).
 
 ---
 
@@ -426,3 +427,92 @@ Deliberately out of scope, and still true of `fixed/`:
 - Everything is emitted into one flat `PT_LOAD`; there is no `.data`/`.bss`
   separation. That is M3.
 - It still cannot assemble its own source — that needs M2 first.
+
+---
+
+## 7. A2 — memory operands, extended registers, shifts
+
+The design brief for this one came from netpipe: keep the instruction set small
+and portable, and use shifts instead of `imul`/`idiv`. That reframed M2 usefully.
+The blocker was never a long list of missing instructions — it was that the
+assembler had **no memory operand form at all**, so nothing could load or store a
+variable. The upstream `c-compiler/` emits `mov [rsp], rax` and
+`mov [vars + 0], rax`, neither of which the assembler could encode.
+
+So A2 adds one shared ModR/M encoder rather than nineteen instructions.
+
+### 7.1 What it accepts now
+
+```
+registers   rax rcx rdx rbx rsp rbp rsi rdi r8..r15
+operands    reg · imm32 · label
+            [reg] · [reg + N] · [reg - N] · [rip + label] · [label]
+mov         reg,imm · reg,reg · mem,reg · reg,mem
+alu         add or and sub xor cmp, in all of the above directions,
+            plus reg,imm8 and reg,imm32
+shifts      shl shr sar, by 1, by imm8, and by cl
+branches    jmp · je/jz · jne/jnz · jl jle jg jge jb jbe ja jae js jns
+            call · ret · syscall · db
+```
+
+Still deliberately absent: `[base + index]`, scaled indexes, 8/16/32-bit operand
+sizes, and an immediate written straight to memory.
+
+### 7.2 Result
+
+```
+$ make golden
+  bytes: 153, identical to GNU as
+PASS golden1: byte-identical to GNU as, runs, exits 42
+  bytes: 160, identical to GNU as
+PASS golden2: byte-identical to GNU as, runs, exits 55
+  bytes: 194, identical to GNU as
+PASS golden3: byte-identical to GNU as, runs, exits 42
+  bytes: 935, identical to GNU as
+PASS golden4: byte-identical to GNU as, runs, exits 0
+PASS regression: 'mov rax, 60' assembles (used to error)
+PASS regression: 'call foo' assembles (used to segfault)
+PASS regression: s/r lines assemble (sub, shl, shr, syscall, ret)
+PASS regression: an unknown mnemonic is reported, not skipped
+```
+
+`golden3` is a running program that exercises the new forms and exits 42.
+`golden4` is 935 bytes of pure encoding coverage — it exits immediately and the
+rest exists only to be byte-compared: all sixteen registers as both operand and
+memory base, every displacement class, all six ALU ops in all three directions,
+all three shifts in all three forms, every conditional branch, and RIP-relative
+loads and stores.
+
+### 7.3 Encoding corners that the coverage test exists to catch
+
+None of these announce themselves — each one silently produces a wrong address
+or a wrong instruction:
+
+- **`[rbp]` and `[r13]` cannot use the `mod=00` form.** That bit pattern means
+  RIP-relative in 64-bit mode, so both always carry an explicit displacement,
+  even when it is zero.
+- **`[rsp]` and `[r12]` need a SIB byte.** `rm=100` means "a SIB follows", so a
+  plain `[rsp]` is encoded as `mod=00 rm=100` plus SIB `0x24`.
+- **`shl reg, 1` has its own shorter opcode** (`D1 /4`, not `C1 /4 ib`), and
+  binutils uses it.
+- **`<op> rax, imm32` has an accumulator form** with no ModR/M byte at all
+  (`ADD`=`05`, `OR`=`0D`, `AND`=`25`, `SUB`=`2D`, `XOR`=`35`, `CMP`=`3D`), one
+  byte shorter, and binutils uses that too.
+- **`reg, mem` and `mem, reg` are different opcodes**, `op` and `op+2`.
+- **The `reg` field and the `r/m` field take different REX bits** — `REX.R` and
+  `REX.B` respectively — so `add r8, r15` needs both.
+
+The last two of those were caught by the byte comparison, not by anything
+running. That is the argument for the comparison in one line.
+
+### 7.4 What is left before `nano_cc` output can be assembled
+
+Across the six demos, `nano_cc` still emits these, and every one of them is on
+netpipe's synthesise-instead list rather than the implement-in-the-assembler list:
+
+```
+push pop lea leave test movzx movsx sete setg setl setle neg not imul idiv cqo
+```
+
+That is the C-min milestone — a `nano_cc` output mode that emits only the
+minimal set. About 44 emit sites in `simpleC++.c`.
