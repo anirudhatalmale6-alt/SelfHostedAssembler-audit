@@ -454,7 +454,7 @@ So A2 adds one shared ModR/M encoder rather than nineteen instructions.
 ### 7.1 What it accepts now
 
 ```
-registers   rax rcx rdx rbx rsp rbp rsi rdi r8..r15
+registers   rax rcx rdx rbx rsp rbp rsi rdi r8..r15, and al cl dl bl
 operands    reg · imm32 · label
             [reg] · [reg + N] · [reg - N] · [rip + label] · [label]
 mov         reg,imm · reg,reg · mem,reg · reg,mem
@@ -465,8 +465,18 @@ branches    jmp · je/jz · jne/jnz · jl jle jg jge jb jbe ja jae js jns
             call · ret · syscall · db
 ```
 
-Still deliberately absent: `[base + index]`, scaled indexes, 8/16/32-bit operand
-sizes, and an immediate written straight to memory.
+```
+byte access mov al, [mem] · mov [mem], al   (also cl, dl, bl)
+```
+
+Still deliberately absent: `[base + index]`, scaled indexes, 16/32-bit operand
+sizes, `ah`/`ch`/`dh`/`bh`, and an immediate written straight to memory.
+
+The byte forms were added after C-min: they are the one thing on the
+synthesise-instead list that genuinely cannot be synthesised. A 1-byte store
+built from 8-byte operations means reading and rewriting the seven bytes around
+it, which may not be mapped and is not the same operation. `char`, strings and
+`printf` all depend on it.
 
 ### 7.2 Result
 
@@ -524,5 +534,8 @@ netpipe's synthesise-instead list rather than the implement-in-the-assembler lis
 push pop lea leave test movzx movsx sete setg setl setle neg not imul idiv cqo
 ```
 
-That is the C-min milestone — a `nano_cc` output mode that emits only the
-minimal set. About 44 emit sites in `simpleC++.c`.
+**That is now done** — `nano_cc --minimal` synthesises every one of them. See
+`make minimal` in the compiler repo. What remains between the two halves is
+assembly *syntax*, not instructions: `nano_cc` emits GNU-as Intel
+(`.section`, `.globl`, `.string`, `.zero`, `qword ptr`, `offset`) and mini-asm
+reads a NASM subset (`section`, `global`, `db`, no size keywords).

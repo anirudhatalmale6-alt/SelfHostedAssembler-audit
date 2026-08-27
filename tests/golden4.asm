@@ -219,6 +219,18 @@ coverage:
     ja coverage
     js coverage
     jns coverage
+    mov al, [rax]
+    mov cl, [rbp - 8]
+    mov dl, [rsp]
+    mov bl, [rcx + 100000]
+    mov [rcx], al
+    mov [rbp - 8], cl
+    mov [rsp], dl
+    mov [rdx + 16], bl
+    mov al, [r12]
+    mov [r13 - 8], cl
+    mov al, [rip + gdata]
+    mov [rip + gdata], al
     mov rax, [rip + gdata]
     mov [rip + gdata], rax
     add rax, [rip + gdata]
