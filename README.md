@@ -8,20 +8,24 @@ Two things live here:
    use, so both assemblers can be **built and run with plain binutils** (`as` +
    `ld`), no NASM needed. It is deliberately faithful: it fixes nothing, so a
    bug in the `.asm` is still a bug in the binary.
-2. **This document** — what happens when you actually run them, and why the
-   answer to *"can we compile `nano_cc` with this?"* is **not yet**.
+2. **This document** — what happens when you actually run them, what was wrong,
+   and how the answer to *"can we compile `nano_cc` with this?"* went from
+   **not yet** to **yes, for the output**.
 
 ```sh
 make            # builds selfContained + selfHosted + the toy C compiler
 make check      # runs the reproductions below
 make m1         # builds the corrected assembler from fixed/
 make golden     # byte-compares its output against GNU as
+make bootstrap  # C -> nano_cc -> mini-asm -> running binary, no gcc, no binutils
+                # (pass NANOCC=/path/to/simpleCpp-build-fix)
 ```
 
-**M1 and A2 are done** — `fixed/selfContained.asm` assembles its documented subset
-correctly, now including memory operands, r8-r15 and shifts, and its output is
-byte-for-byte identical to binutils. See [section 6](#6-m1--the-corrected-assembler)
-and [section 7](#7-a2--memory-operands-extended-registers-shifts).
+**The loop closes.** `fixed/selfContained.asm` assembles `nano_cc`'s output into
+a working binary with no gcc and no binutils involved, and everything it emits
+is byte-for-byte identical to GNU as. See [section 6](#6-m1--the-corrected-assembler),
+[section 7](#7-a2--memory-operands-extended-registers-shifts) and
+[section 8](#8-a3--the-loop-closes).
 
 ---
 
