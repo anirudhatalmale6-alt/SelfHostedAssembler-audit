@@ -231,6 +231,12 @@ coverage:
     mov [r13 - 8], cl
     mov al, [rip + gdata]
     mov [rip + gdata], al
+    mov rax, -1
+    xor rax, -1
+    add rax, -5
+    sub rcx, -100000
+    cmp r9, -1
+    mov r11, -2147483648
     mov rax, [rip + gdata]
     mov [rip + gdata], rax
     add rax, [rip + gdata]

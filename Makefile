@@ -67,3 +67,10 @@ m1: $(BUILD)/fixed
 
 golden: $(BUILD)/fixed
 	@sh tests/golden.sh $(abspath $(BUILD))
+
+# End-to-end: C -> nano_cc --minimal --nasm -> mini-asm -> running binary.
+# Point NANOCC at a built clone of anirudhatalmale6-alt/simpleCpp-build-fix.
+NANOCC ?= ../repo
+.PHONY: bootstrap
+bootstrap: $(BUILD)/fixed
+	@sh tests/bootstrap.sh $(abspath $(BUILD)) $(abspath $(NANOCC))

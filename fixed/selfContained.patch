@@ -21,7 +21,24 @@
  ;
  ; REGISTER CONTRACT  (this was the source of most of the original bugs)
  ;   r11 = pass mode: 0 = sizing pass, 1 = emit pass
-@@ -43,6 +53,17 @@
+@@ -30,11 +40,13 @@
+ nl_msg db 10
+ sym_msg db "Error: symbol table full", 10
+ sym_msg_len equ 25
++big_msg db "Error: input larger than the buffer", 10
++big_len equ 36
+ 
+ section .bss
+-in_buf resb 65536 ; 64KB input buffer
+-out_buf resb 65536 ; 64KB output buffer
+-sym_tbl resb 4096 ; Symbol table (max 256 labels)
++in_buf resb 1048576 ; 1MB input buffer
++out_buf resb 1048576 ; 1MB output buffer
++sym_tbl resb 65536 ; symbol table
+ in_fd resq 1
+ out_fd resq 1
+ in_size resq 1
+@@ -43,6 +55,17 @@
  sym_cnt resq 1 ; Number of symbols
  mnemonic_buf resb 8 ; Buffer for safe mnemonic parsing
  key_buf resb 8 ; 4-char space-padded lookup key built by word_key
@@ -39,7 +56,62 @@
  
  section .text
  
-@@ -446,6 +467,8 @@
+@@ -50,8 +73,10 @@
+ base_vaddr equ 0x400000
+ hdr_size equ 120
+ code_vaddr equ base_vaddr + hdr_size
+-sym_max equ 170 ; sym_tbl is 4096 bytes at 24 bytes per entry (the original
+-                ; comment claimed 256, which would have run 2 KB past the table)
++sym_max equ 2730 ; sym_tbl is 65536 bytes at 24 bytes per entry. The original
++                 ; reserved 4096 bytes and claimed 256 entries, which would have
++                 ; run 2 KB past the end of the table.
++buf_size equ 1048576
+ 
+ ; --- ELF64 HEADER (120 Bytes) ---
+ elf_hdr:
+@@ -71,7 +96,8 @@
+ dw 0 ; e_shstrndx
+ phdr:
+ dd 1 ; p_type = PT_LOAD
+-dd 5 ; p_flags = PF_R | PF_X
++dd 7 ; p_flags = PF_R | PF_W | PF_X  (data lives in the same segment,
++     ; so without PF_W any write to a global faults)
+ dq 0 ; p_offset
+ dq base_vaddr ; p_vaddr
+ dq base_vaddr ; p_paddr
+@@ -93,9 +119,13 @@
+     mov rax, 0 ; sys_read
+     mov rdi, [in_fd]
+     mov rsi, in_buf
+-    mov rdx, 65536
++    mov rdx, buf_size
+     syscall
+     mov [in_size], rax
++    ; A short buffer would silently assemble the first N bytes and drop the
++    ; rest, which is far worse than refusing.
++    cmp rax, buf_size
++    jge input_too_big
+     mov rax, 3 ; sys_close
+     mov rdi, [in_fd]
+     syscall
+@@ -160,6 +190,16 @@
+     mov rdi, 1
+     syscall
+ 
++input_too_big:
++    mov rax, 1
++    mov rdi, 2
++    mov rsi, big_msg
++    mov rdx, big_len
++    syscall
++    mov rax, 60
++    mov rdi, 1
++    syscall
++
+ ; A word that is neither a known instruction nor a known directive. Reported
+ ; rather than skipped: silently dropping a line the assembler does not
+ ; understand produces a binary that is quietly missing instructions.
+@@ -446,6 +486,8 @@
      je parse_sys
      cmp r15, 7
      je parse_db
@@ -48,7 +120,7 @@
      jmp error_exit              ; table entry with an unknown type
  
  .not_found:
-@@ -508,104 +531,554 @@
+@@ -508,104 +550,554 @@
  ; ==============================================================================
  ; PARSERS
  ; ==============================================================================
@@ -244,7 +316,8 @@
 +    call find_symbol
 +    cmp rax, 0
 +    jne .rip_got
-+    test r11, r11
+     test r11, r11
+-    jz .size_imm
 +    jnz error_exit
 +    xor rax, rax
 +.rip_got:
@@ -257,8 +330,7 @@
 +    call find_symbol
 +    cmp rax, 0
 +    jne .label_got
-     test r11, r11
--    jz .size_imm
++    test r11, r11
 +    jnz error_exit
 +    xor rax, rax
 +.label_got:
@@ -348,14 +420,11 @@
 +    cmp r10, 0
 +    je .no_rex
 +    mov rdi, r10
-     call emit_byte
--    mov rdi, 0xC7
++    call emit_byte
 +    add qword [pc_vaddr], 1
 +.no_rex:
 +    mov rdi, rbp
-     call emit_byte
--    mov rdi, r12
--    or rdi, 0xC0
++    call emit_byte
 +    add qword [pc_vaddr], 1
 +
 +    mov r9, r12
@@ -370,8 +439,7 @@
 +    or rax, r9
 +    or rax, 0xC0
 +    mov rdi, rax
-     call emit_byte
--    mov rdi, r15
++    call emit_byte
 +    add qword [pc_vaddr], 1
 +    ret
 +
@@ -408,14 +476,17 @@
 +    or rax, r9
 +    or rax, rcx
 +    mov rdi, rax
-+    call emit_byte
+     call emit_byte
+-    mov rdi, 0xC7
 +    add qword [pc_vaddr], 1
 +
 +    ; rsp and r12 (rm == 4) need a SIB byte selecting "base, no index"
 +    cmp r8, 4
 +    jne .no_sib
 +    mov rdi, 0x24
-+    call emit_byte
+     call emit_byte
+-    mov rdi, r12
+-    or rdi, 0xC0
 +    add qword [pc_vaddr], 1
 +.no_sib:
 +    cmp rcx, 0x40
@@ -425,7 +496,8 @@
 +    ret
 +.emit_d8:
 +    mov rdi, rdx
-+    call emit_byte
+     call emit_byte
+-    mov rdi, r15
 +    add qword [pc_vaddr], 1
 +    ret
 +.emit_d32:
@@ -672,7 +744,7 @@
  
  ; jmp rel32  ->  E9 cd  (5 bytes)
  parse_jmp:
-@@ -814,6 +1287,9 @@
+@@ -814,6 +1306,9 @@
      ret
  
  is_register:
@@ -682,7 +754,7 @@
      cmp rcx, 3
      jne .no_reg
      mov eax, [rdi]
-@@ -834,6 +1310,37 @@
+@@ -834,6 +1329,37 @@
      je .r6
      cmp eax, 'rdi'
      je .r7
@@ -720,7 +792,7 @@
  .no_reg:
      mov rax, -1
      ret
-@@ -856,6 +1363,34 @@
+@@ -856,12 +1382,52 @@
      ret
  .r7: mov eax, 7
      ret
@@ -755,7 +827,38 @@
  
  is_number:
      xor rax, rax
-@@ -965,17 +1500,32 @@
+     xor rdx, rdx
++    xor r8, r8                  ; negative?
+     cmp rcx, 0
+     je .done
++    ; A leading minus was not handled at all, so `xor rax, -1` - which is how a
++    ; minimal-instruction-set compiler writes `not` - failed to parse.
++    movzx rbx, byte [rdi]
++    cmp bl, '-'
++    jne .nosign
++    mov r8, 1
++    inc rdi
++    dec rcx
++    cmp rcx, 0
++    je .invalid                 ; a lone "-" is not a number
++.nosign:
+     cmp rcx, 2
+     jl .dec
+     cmp word [rdi], '0x'
+@@ -908,6 +1474,12 @@
+     inc rdi
+     jmp .hex_loop
+ .done:
++    cmp r8, 0
++    je .positive
++    mov rbx, 0
++    sub rbx, rax
++    mov rax, rbx
++.positive:
+     mov rdx, 1
+     ret
+ .invalid:
+@@ -965,17 +1537,32 @@
  ; ==============================================================================
  align 8
  opcode_table:

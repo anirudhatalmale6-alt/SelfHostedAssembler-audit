@@ -40,11 +40,13 @@ unk_len equ 25
 nl_msg db 10
 sym_msg db "Error: symbol table full", 10
 sym_msg_len equ 25
+big_msg db "Error: input larger than the buffer", 10
+big_len equ 36
 
 section .bss
-in_buf resb 65536 ; 64KB input buffer
-out_buf resb 65536 ; 64KB output buffer
-sym_tbl resb 4096 ; Symbol table (max 256 labels)
+in_buf resb 1048576 ; 1MB input buffer
+out_buf resb 1048576 ; 1MB output buffer
+sym_tbl resb 65536 ; symbol table
 in_fd resq 1
 out_fd resq 1
 in_size resq 1
@@ -71,8 +73,10 @@ section .text
 base_vaddr equ 0x400000
 hdr_size equ 120
 code_vaddr equ base_vaddr + hdr_size
-sym_max equ 170 ; sym_tbl is 4096 bytes at 24 bytes per entry (the original
-                ; comment claimed 256, which would have run 2 KB past the table)
+sym_max equ 2730 ; sym_tbl is 65536 bytes at 24 bytes per entry. The original
+                 ; reserved 4096 bytes and claimed 256 entries, which would have
+                 ; run 2 KB past the end of the table.
+buf_size equ 1048576
 
 ; --- ELF64 HEADER (120 Bytes) ---
 elf_hdr:
@@ -92,7 +96,8 @@ dw 0 ; e_shnum
 dw 0 ; e_shstrndx
 phdr:
 dd 1 ; p_type = PT_LOAD
-dd 5 ; p_flags = PF_R | PF_X
+dd 7 ; p_flags = PF_R | PF_W | PF_X  (data lives in the same segment,
+     ; so without PF_W any write to a global faults)
 dq 0 ; p_offset
 dq base_vaddr ; p_vaddr
 dq base_vaddr ; p_paddr
@@ -114,9 +119,13 @@ _start:
     mov rax, 0 ; sys_read
     mov rdi, [in_fd]
     mov rsi, in_buf
-    mov rdx, 65536
+    mov rdx, buf_size
     syscall
     mov [in_size], rax
+    ; A short buffer would silently assemble the first N bytes and drop the
+    ; rest, which is far worse than refusing.
+    cmp rax, buf_size
+    jge input_too_big
     mov rax, 3 ; sys_close
     mov rdi, [in_fd]
     syscall
@@ -176,6 +185,16 @@ error_exit:
     mov rdi, 2 ; stderr
     mov rsi, err_msg
     mov rdx, err_len
+    syscall
+    mov rax, 60
+    mov rdi, 1
+    syscall
+
+input_too_big:
+    mov rax, 1
+    mov rdi, 2
+    mov rsi, big_msg
+    mov rdx, big_len
     syscall
     mov rax, 60
     mov rdi, 1
@@ -1395,8 +1414,20 @@ is_register:
 is_number:
     xor rax, rax
     xor rdx, rdx
+    xor r8, r8                  ; negative?
     cmp rcx, 0
     je .done
+    ; A leading minus was not handled at all, so `xor rax, -1` - which is how a
+    ; minimal-instruction-set compiler writes `not` - failed to parse.
+    movzx rbx, byte [rdi]
+    cmp bl, '-'
+    jne .nosign
+    mov r8, 1
+    inc rdi
+    dec rcx
+    cmp rcx, 0
+    je .invalid                 ; a lone "-" is not a number
+.nosign:
     cmp rcx, 2
     jl .dec
     cmp word [rdi], '0x'
@@ -1443,6 +1474,12 @@ is_number:
     inc rdi
     jmp .hex_loop
 .done:
+    cmp r8, 0
+    je .positive
+    mov rbx, 0
+    sub rbx, rax
+    mov rax, rbx
+.positive:
     mov rdx, 1
     ret
 .invalid:

@@ -539,3 +539,58 @@ push pop lea leave test movzx movsx sete setg setl setle neg not imul idiv cqo
 assembly *syntax*, not instructions: `nano_cc` emits GNU-as Intel
 (`.section`, `.globl`, `.string`, `.zero`, `qword ptr`, `offset`) and mini-asm
 reads a NASM subset (`section`, `global`, `db`, no size keywords).
+
+---
+
+## 8. A3 — the loop closes
+
+`make bootstrap` compiles each demo the ordinary way (nano_cc, then gcc to
+assemble and link) and again through `nano_cc --minimal --nasm` assembled by
+mini-asm alone, and requires the two binaries to behave identically.
+
+```
+$ make bootstrap NANOCC=../simpleCpp-build-fix
+PASS test: same output as the gcc-assembled build (6700 byte binary)
+PASS features: same output as the gcc-assembled build (8156 byte binary)
+PASS structs: same output as the gcc-assembled build (7870 byte binary)
+PASS bitwise: same output as the gcc-assembled build (8235 byte binary)
+PASS printf: same output as the gcc-assembled build (6842 byte binary)
+PASS switch: same output as the gcc-assembled build (8584 byte binary)
+```
+
+C source in, running ELF out, with no gcc and no binutils anywhere in the path.
+
+### 8.1 What this milestone had to add
+
+**On the assembler side:**
+
+- `p_flags` was `5` (read + execute). Everything lives in one `PT_LOAD`, so a
+  program with a writable global faulted on its first store. Now `7`.
+- Buffers were 64 KB with **no check that the file fit**. A larger input would
+  have assembled the first 64 KB and silently dropped the rest — the worst
+  possible failure. Now 1 MB, and it refuses rather than truncating.
+- The symbol table held 170 entries. `switch.c` alone emits 147 labels before
+  minimal mode adds more. Now 2730.
+- **`is_number` could not parse a leading minus.** `xor rax, -1` is how a
+  minimal-instruction-set compiler writes `not`, so this stopped the bitwise
+  demo dead. Negative immediates now parse, and `golden4` covers them.
+
+**On the compiler side:**
+
+- `--nasm`: `section`/`global` instead of `.section`/`.globl`, `db` instead of
+  `.string` and `.zero`, no `offset`, no `ptr` size keywords.
+- String literals are **pooled and emitted after the last function**. In GNU-as
+  mode `gen_string` switches to `.rodata`, emits the bytes inline and switches
+  back. With one flat segment there is no `.rodata` to switch to, so those bytes
+  would have sat in the instruction stream and been executed.
+- `dil`, `sil` and `r8b`..`r15b` need a REX prefix to name at all, and the
+  minimal target only has the four REX-free byte registers. A `char` parameter
+  now goes through `rax` on the way to its stack slot.
+
+### 8.2 Still true
+
+The assembler cannot yet assemble its own source — that needs `[base + index]`,
+`push`/`pop`, `lea`, `test`, `movzx` and `rep`, which are exactly the
+instructions the minimal-set argument says to keep out of it. Self-hosting it
+would mean rewriting `selfContained.asm` against its own subset, which is a
+separate decision rather than a missing feature.
