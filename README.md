@@ -606,14 +606,14 @@ what stands in the way — it is a much smaller list than it looked.
 construct outside the assembler's own accepted subset, so the whole gap is
 visible at once instead of one `unknown mnemonic` abort at a time.
 
-Against `fixed/selfContained.asm` (1597 lines) it reports **156 sites**:
+Against `fixed/selfContained.asm` it reports **168 sites**:
 
 | Sites | Construct | Rewrite inside the existing subset |
 |------:|-----------|------------------------------------|
-| 46 | `eax` (and 1 `edi`) | needs a **dword operand size** |
-| 36 | `inc` | `add reg, 1` |
-| 22 | `movzx r64, byte [m]` | `mov al, [m]` + `and rax, 255` |
-| 17 | `test r, r` | `cmp r, 0` |
+| 49 | `eax` (and 1 `edi`) | needs a **dword operand size** |
+| 41 | `inc` | `add reg, 1` |
+| 25 | `movzx r64, byte [m]` | `mov al, [m]` + `and rax, 255` |
+| 18 | `test r, r` | `cmp r, 0` |
 | 9 | `ax` | needs a **word operand size** |
 | 7 | `lea r, [sym]` | `mov r, sym` — a bare symbol already assembles as its address |
 | 4 | `push` | `sub rsp, 8` + `mov [rsp], r` |
@@ -624,6 +624,11 @@ Against `fixed/selfContained.asm` (1597 lines) it reports **156 sites**:
 | 1 | `rep movsb` | explicit loop |
 | 1 | `dec` | `sub reg, 1` |
 | 1 | `dil` | route through `al` |
+
+*(It was 156 before the `dw`/`dd`/`dq` work in section 10 — that added code,
+and the new code is written in the same style as the rest of the file. The
+count is a measurement, not a target; it will keep moving until the rewrite
+is done deliberately.)*
 
 Two things follow from this.
 
@@ -661,3 +666,29 @@ in the compiler, not the assembler. `nano_cc` currently rejects its own source:
 The `unsigned` row is the dangerous one: it is accepted rather than rejected,
 so a self-compiled build would differ from a gcc-built one only in the
 arithmetic, and only sometimes.
+
+---
+
+## 10. Data directives: `dw`, `dd`, `dq`
+
+Added so the compiler can emit a pointer inside a global initialiser
+(`char *r[3] = {"a","b","c"}` becomes `dq .LD0` / `dq .LD1` / `dq .LD2`).
+
+Two bugs surfaced doing it, both silent:
+
+**`dw`/`dd`/`dq` were in the "recognised and ignored" table.** `pp: dq msg`
+emitted **nothing** and did not advance the program counter, so `pp` silently
+aliased whatever label came next and every address after it was wrong. No
+error, no warning — the program just read the wrong memory. They are real
+directives now, handled by `parse_data`, and removed from `directive_table`.
+
+**`[label + N]` dropped the displacement.** `parse_operand` stored the symbol
+address and jumped straight to `.close`, skipping the code that parses `+ N`,
+so `[nums + 8]` assembled as `[nums]`. It produced a working binary that read
+the wrong field — a one-byte difference in the encoding, which is exactly the
+class of bug only the byte comparison against GNU as catches. `golden5.asm`
+now covers it.
+
+A forward reference in a data directive (`pp: dq msg` with `msg` defined
+further down) is normal, so an unknown symbol is a placeholder during the
+sizing pass and an error only during the emit pass.
