@@ -5,7 +5,7 @@
 #   make check    # run the reproductions from README.md
 #   make clean
 
-UP      ?= upstream
+UP      ?= original
 BUILD    = build
 PY      ?= python3
 AS      ?= as
@@ -19,8 +19,10 @@ CC      ?= gcc
 all: $(BUILD)/selfContained $(BUILD)/cc_boot
 	-@$(MAKE) --no-print-directory $(BUILD)/selfHosted
 
+# Upstream HEAD now carries the M1 fix (netpipe applied it), so the audit in
+# section 1 is run against the vendored pre-M1 sources in original/ instead.
 fetch:
-	@test -d $(UP) || git clone --depth 1 https://github.com/netpipe/SelfHostedAssembler.git $(UP)
+	@test -d upstream || git clone --depth 1 https://github.com/netpipe/SelfHostedAssembler.git upstream
 
 $(BUILD):
 	@mkdir -p $(BUILD)

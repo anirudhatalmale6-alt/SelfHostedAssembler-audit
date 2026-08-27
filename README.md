@@ -41,7 +41,14 @@ fails well before shifts matter.
 
 ## 1. Reproductions
 
-Built from a clean checkout, no edits to any `.asm` or `.c`.
+> **Note.** Upstream HEAD now carries the M1 fix — netpipe applied the patch and
+> pushed it as commit `72a37b0 "compiles"`, and the history before that was
+> rewritten, so the original commits are no longer fetchable. The pre-M1 sources
+> are therefore vendored in `original/` and `make check` runs against those, so
+> the findings below stay checkable. `make fetch` still clones current upstream
+> into `upstream/` for the patch to apply to.
+
+Run against the pre-M1 sources, no edits to any `.asm` or `.c`.
 
 ### 1.0 `selfHosted.asm` does not assemble
 
@@ -346,13 +353,16 @@ It is a build aid, not a general NASM implementation.
 ## 6. M1 — the corrected assembler
 
 `fixed/selfContained.asm` is `selfContained.asm` with every fault from section 2.1
-fixed. `fixed/selfContained.patch` is the same change as a unified diff, ready to
-apply upstream:
+fixed. `fixed/selfContained.patch` carries the change as a unified diff, ready to apply
+to current upstream:
 
 ```sh
 cd SelfHostedAssembler
 patch -p1 < selfContained.patch
 ```
+
+Since upstream already contains M1, that patch is now the **A2** change alone
+(section 7).
 
 ### 6.1 Result
 
