@@ -593,8 +593,71 @@ C source in, running ELF out, with no gcc and no binutils anywhere in the path.
 
 ### 8.2 Still true
 
-The assembler cannot yet assemble its own source — that needs `[base + index]`,
-`push`/`pop`, `lea`, `test`, `movzx` and `rep`, which are exactly the
-instructions the minimal-set argument says to keep out of it. Self-hosting it
-would mean rewriting `selfContained.asm` against its own subset, which is a
-separate decision rather than a missing feature.
+The assembler cannot yet assemble its own source. See section 9 for exactly
+what stands in the way — it is a much smaller list than it looked.
+
+---
+
+## 9. Self-host readiness: the measured gap
+
+    make selfhost-scan
+
+`tools/selfhost_scan.py` walks a NASM-subset source and reports **every**
+construct outside the assembler's own accepted subset, so the whole gap is
+visible at once instead of one `unknown mnemonic` abort at a time.
+
+Against `fixed/selfContained.asm` (1597 lines) it reports **156 sites**:
+
+| Sites | Construct | Rewrite inside the existing subset |
+|------:|-----------|------------------------------------|
+| 46 | `eax` (and 1 `edi`) | needs a **dword operand size** |
+| 36 | `inc` | `add reg, 1` |
+| 22 | `movzx r64, byte [m]` | `mov al, [m]` + `and rax, 255` |
+| 17 | `test r, r` | `cmp r, 0` |
+| 9 | `ax` | needs a **word operand size** |
+| 7 | `lea r, [sym]` | `mov r, sym` — a bare symbol already assembles as its address |
+| 4 | `push` | `sub rsp, 8` + `mov [rsp], r` |
+| 4 | `pop` | `mov r, [rsp]` + `add rsp, 8` |
+| 3 | `[rdi + rcx]` (SIB) | `add rdi, rcx` then `[rdi]` |
+| 3 | `imul r, const` | shift-add |
+| 1 | `mul rcx` | shift-add |
+| 1 | `rep movsb` | explicit loop |
+| 1 | `dec` | `sub reg, 1` |
+| 1 | `dil` | route through `al` |
+
+Two things follow from this.
+
+**Every directive the source uses is already implemented.** `section`,
+`global`, `align`, `equ`, `db`/`dw`/`dd`/`dq` and `resb`/`resq` all assemble
+today, so none of the gap is directive work.
+
+**Only two of the fourteen rows need the assembler changed at all** — the 56
+`eax`/`ax` sites. Those are not new *instructions*; they are new operand
+*sizes*, and the operand slots already carry a size field (`opA + 32`) that
+today holds only 8 or 64. Extending it to 16 and 32 is a `0x66` prefix and
+dropping `REX.W`, which keeps the instruction set exactly as small as it is
+now. The remaining 100 sites are mechanical rewrites of the assembler's own
+source, changing no encoding logic whatsoever.
+
+The rewrites in the right-hand column are not theoretical — `tests/` includes
+a program built entirely from them (bare symbol as immediate, `add` for `inc`,
+`cmp r, 0` for `test`, manual `rsp` arithmetic for `push`/`pop`) which
+assembles and runs correctly under the assembler as it stands today.
+
+### 9.1 A separate question: building the *compiler* without gcc
+
+Assembling `nano_cc`'s **output** works today for every demo. Building
+`nano_cc` **itself** without gcc is a different problem, and the blockers are
+in the compiler, not the assembler. `nano_cc` currently rejects its own source:
+
+| Construct | Uses in `simpleC++.c` | Status |
+|-----------|----------------------:|--------|
+| `typedef` | 9 | `error: type expected` |
+| `enum` | 3 | `error: type expected` |
+| brace initialisers | 7 | `error: expression expected` |
+| `unsigned` | 21 | **parses and is silently ignored** |
+| libc (`malloc`, `fopen`, `printf`, `strcmp`, …) | 19 distinct functions across 5 `#include`s | needs a freestanding replacement |
+
+The `unsigned` row is the dangerous one: it is accepted rather than rejected,
+so a self-compiled build would differ from a gcc-built one only in the
+arithmetic, and only sometimes.

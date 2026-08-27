@@ -74,3 +74,11 @@ NANOCC ?= ../repo
 .PHONY: bootstrap
 bootstrap: $(BUILD)/fixed
 	@sh tests/bootstrap.sh $(abspath $(BUILD)) $(abspath $(NANOCC))
+
+# ---- self-host readiness ----------------------------------------------------
+# Lists every construct in a source that falls outside the assembler's own
+# accepted subset, so the whole gap is visible at once rather than one
+# "unknown mnemonic" abort at a time.
+.PHONY: selfhost-scan
+selfhost-scan:
+	-@$(PY) tools/selfhost_scan.py fixed/selfContained.asm

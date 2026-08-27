@@ -204,6 +204,22 @@ def main(path):
                     txt)
             s = "".join(seg if seg.startswith("[") else deref(seg)
                         for seg in re.split(r"(\[[^\]]*\])", s))
+
+        # mini-asm treats `[label]` as RIP-relative (same as `[rip + label]`),
+        # but GAS Intel syntax reads it as an absolute address and encodes a
+        # SIB form that is one byte longer. Make the reference agree with the
+        # semantics being tested, or every bare-label operand mismatches.
+        def riprel(m):
+            inner = m.group(1).strip()
+            # only a bare symbol, optionally plus a NUMERIC displacement --
+            # `[sym + rcx]` is a real base/index form and must stay as it is
+            base = re.match(
+                r"^([A-Za-z_][\w]*)(\s*[+-]\s*(?:0x[0-9a-fA-F]+|\d+))?$", inner)
+            if base and base.group(1) in syms:
+                return "[rip + %s%s]" % (base.group(1), base.group(2) or "")
+            return m.group(0)
+
+        s = re.sub(r"\[([^\]]*)\]", riprel, s)
         out.append("    " + s)
 
     return "\n".join(out) + "\n"
