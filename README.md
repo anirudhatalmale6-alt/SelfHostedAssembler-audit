@@ -19,13 +19,18 @@ make m1         # builds the corrected assembler from fixed/
 make golden     # byte-compares its output against GNU as
 make bootstrap  # C -> nano_cc -> mini-asm -> running binary, no gcc, no binutils
                 # (pass NANOCC=/path/to/simpleCpp-build-fix)
+make selfhost   # the COMPILER itself, built by mini-asm, twice, identically
 ```
 
-**The loop closes.** `fixed/selfContained.asm` assembles `nano_cc`'s output into
-a working binary with no gcc and no binutils involved, and everything it emits
-is byte-for-byte identical to GNU as. See [section 6](#6-m1--the-corrected-assembler),
-[section 7](#7-a2--memory-operands-extended-registers-shifts) and
-[section 8](#8-a3--the-loop-closes).
+**The loop closes, all the way round.** `fixed/selfContained.asm` assembles
+`nano_cc`'s own source into a working 220,794-byte compiler with no gcc and no
+binutils anywhere in the path — and that compiler, compiling itself again and
+being assembled again, produces a **byte-for-byte identical binary**. See
+[section 11](#11-resb-and-the-compiler-that-builds-itself). Everything the
+assembler emits is still byte-for-byte identical to GNU as
+([section 6](#6-m1--the-corrected-assembler),
+[section 7](#7-a2--memory-operands-extended-registers-shifts),
+[section 8](#8-a3--the-loop-closes)).
 
 ---
 
@@ -717,3 +722,95 @@ now covers it.
 A forward reference in a data directive (`pp: dq msg` with `msg` defined
 further down) is normal, so an unknown symbol is a placeholder during the
 sizing pass and an error only during the emit pass.
+
+---
+
+## 11. `resb`, and the compiler that builds itself
+
+`make selfhost`:
+
+```
+the compiler compiles its own source, for mini-asm
+         2664 lines of C -> 872228 bytes of asm
+stage 1: mini-asm assembles it, with no binutils
+         220794 byte compiler, built by an assembler written in assembly
+PASS stage1 compiles test.c to identical assembly
+PASS stage1 compiles features.c to identical assembly
+PASS stage1 compiles structs.c to identical assembly
+PASS stage1 compiles bitwise.c to identical assembly
+PASS stage1 compiles printf.c to identical assembly
+PASS stage1 compiles switch.c to identical assembly
+PASS stage1 compiles casts.c to identical assembly
+stage 2: stage1 compiles the same source, mini-asm assembles that
+PASS stage1's output for the compiler source == the input stage1 was built from
+PASS stage1 binary == stage2 binary, byte for byte (220794 bytes)
+```
+
+Three claims, in increasing order of how hard they are to satisfy by accident.
+The binary *runs*. It compiles seven programs to assembly identical to the
+reference compiler's. And it reaches a **fixed point**: compiling its own source
+again, and assembling that again, produces the same 220,794 bytes. A compiler
+can pass the first two and still be wrong; it cannot pass the third and stay
+wrong, because any difference in what it emits for its own source lands in the
+next binary.
+
+### 11.1 What stood between here and there
+
+**`resb` was in the "recognised and ignored" table**, so `in_buf resb 65536`
+was skipped whole and the label was **never defined**. The first reference to it
+then failed with `Error:` and nothing else. That is why the compiler's `--nasm`
+output could not use `.bss` at all, and why its ~19 MB of uninitialised globals
+were written out as `db 0, 0, 0, …` instead: a **61,180,857-byte** `.asm` file,
+which this assembler quite correctly refused.
+
+With `nano_cc --bss` emitting `resb` and this assembler honouring it, the same
+file is **871,603 bytes**. Seventy times smaller, and inside every limit.
+
+**Reservations go at a fixed address**, `base_vaddr + 0x400000`, not "wherever
+the code ends". The assembler is two-pass and pass 2 must emit exactly the byte
+counts pass 1 measured — but instruction length here depends on an operand's
+*value* (`mov reg, imm32` is 7 bytes, the `movabs` form is 10). A `.bss` label
+placed after the code would not have a value until pass 1 had finished, so the
+two passes would size it differently and every label after it would be wrong. A
+fixed base is known before pass 1 starts.
+
+Everything between `p_filesz` and `p_memsz` is zero-filled by the kernel, so the
+gap costs address space and nothing in the file or in resident memory. With
+nothing reserved, `p_memsz` stays equal to `p_filesz` and every existing program
+produces the same bytes it did.
+
+### 11.2 Three other things it took, all of them silent
+
+**`word_key` only accepted `a`–`z`.** It builds the four-character key every
+lookup uses, and it stopped at the first character outside that range. So
+`_n resb 8` produced a key of four *spaces* — which then matched the `'    '`
+**terminator** of whichever table was searched next, because both tables
+compared the key before checking for the end. The line was treated as a
+directive to ignore, the label was never defined, and the failure surfaced much
+later as a bad reference rather than a missing definition. It now accepts the
+whole identifier set, and both tables test the terminator first.
+
+**`mov al, 9` assembled to `88 c0`, which is `mov al, al`.** `parse_mov` checks
+for a byte-sized operand *before* it checks for an immediate, so it read the
+immediate slot as a register index and found zero. **`cmp al, 9` assembled to
+`48 83 f8 09`, which is `cmp rax, 9`** — a correct instruction for the wrong
+register, and after `mov al, [rsi]` the upper 56 bits of `rax` are whatever they
+were. Both are outside the documented subset; both now say so instead of
+emitting plausible wrong bytes. Encoding `b0+r` and `3c` would be better still,
+and is not what this milestone was for.
+
+**The symbol table held 2,730 entries.** Enough for every hand-written test here
+and not for a real input: `nano_cc`'s own source is 4,024 labels. It reported
+`symbol table full` rather than overrunning, which is the only reason that was a
+five-minute problem. Now 10,922.
+
+### 11.3 And errors say which line
+
+```
+Error: 
+    mov rax, [rip + _n]
+```
+
+`Error:` on its own is a fine report for a nine-line test program and useless
+for a 39,000-line one. Both error paths now print the source line the read
+pointer is in. Nothing else in this section would have been findable without it.

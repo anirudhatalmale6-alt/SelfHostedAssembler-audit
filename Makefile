@@ -75,6 +75,13 @@ NANOCC ?= ../repo
 bootstrap: $(BUILD)/fixed
 	@sh tests/bootstrap.sh $(abspath $(BUILD)) $(abspath $(NANOCC))
 
+# The whole loop: the compiler's OWN source, compiled by the compiler, assembled
+# by this assembler, and the result made to do it again and come out identical.
+# No gcc and no binutils anywhere in it.
+.PHONY: selfhost
+selfhost: $(BUILD)/fixed
+	@sh tests/selfhost.sh $(abspath $(BUILD)) $(abspath $(NANOCC))
+
 # ---- self-host readiness ----------------------------------------------------
 # Lists every construct in a source that falls outside the assembler's own
 # accepted subset, so the whole gap is visible at once rather than one
