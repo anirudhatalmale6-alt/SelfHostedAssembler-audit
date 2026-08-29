@@ -43,12 +43,14 @@ for c in $CASES; do
     # assemblers are making the same encoding choice
     python3 "$ROOT/tools/nasm2gas.py" --long-jumps "$ROOT/tests/$name.asm" > "$work/ref.s"
     as --64 -o "$work/ref.o" "$work/ref.s"
-    ld -Ttext 0x400078 --oformat binary -o "$work/ref.bin" "$work/ref.o" 2>/dev/null
+    ld -Ttext 0x4000b0 --oformat binary -o "$work/ref.bin" "$work/ref.o" 2>/dev/null
 
     if python3 - "$work" <<'PY'
 import sys
 w = sys.argv[1]
-mini = open(w + "/a.out", "rb").read()[120:]
+# 176, not 120: the header carries two program headers now, so the code
+# starts 56 bytes further in. 0x4000b0 above is the same number.
+mini = open(w + "/a.out", "rb").read()[176:]
 ref = open(w + "/ref.bin", "rb").read()
 if mini == ref:
     print("  bytes: %d, identical to GNU as" % len(mini))

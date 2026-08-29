@@ -900,3 +900,42 @@ it.
 `[symbol + register]` forms became a RIP-relative `lea` plus an `add`. Also:
 `mov qword [out_base], def_base` stores a 32-bit immediate, which is right at
 `0x400000` and quietly a different number at `0x8000000000`.
+
+---
+
+## 13. Two segments, so nothing is both writable and executable
+
+A single flat segment holding code and data has to be RWX, and one page that is
+both is the property every "write some bytes, then jump to them" technique
+needs. nano-os's loader refuses such a segment outright, which refused every
+binary this assembler produced — the right outcome for the rule and the wrong
+outcome for the machine.
+
+So a `section .data` in the source now splits the image. Everything before it
+becomes a read+execute segment, everything after a read+write one, and nothing
+is both. `nano_cc --nasm` emits that marker between the last function and the
+string pool, which is where code stops and data starts.
+
+```
+LOAD  0x000000 0x0000008000000000 0x001000 0x001000 R E
+LOAD  0x001000 0x0000008000001000 0x000041 0x3ff02c RW
+```
+
+Three things that had to be right:
+
+**The split is padded to a page boundary.** A loader maps a segment at `p_vaddr`
+with the file bytes from `p_offset`, and the two have to be congruent modulo the
+page size. Splitting mid-page would put one page in two segments with different
+permissions, and whichever was mapped second would win, silently.
+
+**The padding happens in both passes.** The byte count comes from `pc_vaddr`,
+which is correct in the sizing pass and the emit pass; `out_ptr` only moves in
+the second, so measuring from it would have made the passes disagree — which the
+size check added in section 12 would now catch, but only after the fact.
+
+**A source with no `section .data` still gets one RWX segment**, because its code
+and data are interleaved and there is nowhere to cut. `e_phnum` is patched to 1
+rather than leaving a header describing a segment that does not exist, and the
+image is byte for byte what it always was. The header grew from 120 to 176 bytes
+either way, which is why the golden tests now compare from offset 176 and link
+their reference at `0x4000b0`.

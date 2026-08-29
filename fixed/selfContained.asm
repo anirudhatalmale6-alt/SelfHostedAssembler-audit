@@ -80,6 +80,7 @@ rex_w resq 1     ; 1 = emit REX.W, 0 = 8-bit operand, REX only if needed
 data_size resq 1 ; element width for dw/dd/dq: 2, 4 or 8 (0 selects db)
 imm_tmp resq 1   ; the immediate being encoded, parked across emit_* calls
 bss_size resq 1  ; bytes reserved by resb/resw/resd/resq so far
+data_split resq 1 ; file offset of `section .data`, or 0 if there was none
 sym_addr resq 1  ; the address add_symbol is about to record
 
 ; Where the OUTPUT is linked. Runtime state now, not assemble-time constants:
@@ -110,7 +111,17 @@ pass1_end resq 1 ; where pass 1 finished; pass 2 has to finish in the same place
 section .text
 
 ; --- CONSTANTS ---
-hdr_size equ 120
+; 176 = one 64-byte ELF header and TWO 56-byte program headers.
+;
+; Two, because one segment has to be both writable and executable and that is
+; the single property every "write some bytes, then jump to them" technique
+; needs. A `section .data` in the source splits the image: everything before it
+; is read+execute, everything after is read+write, and nothing is both.
+;
+; A source with no `section .data` still gets one RWX segment, because its code
+; and its data are interleaved and there is nowhere to cut. e_phnum is patched
+; to 1 in that case rather than leaving a second header full of zeros.
+hdr_size equ 176
 
 ; Where resb/resq reservations live: a fixed distance above the output base,
 ; deliberately, and not "wherever the code happens to end".
@@ -152,15 +163,27 @@ dq 0 ; e_shoff
 dd 0 ; e_flags
 dw 64 ; e_ehsize
 dw 56 ; e_phentsize
-dw 1 ; e_phnum
+dw 2 ; e_phnum (PATCHED to 1 when there is no data section)
 dw 0 ; e_shentsize
 dw 0 ; e_shnum
 dw 0 ; e_shstrndx
 phdr:
 dd 1 ; p_type = PT_LOAD
-dd 7 ; p_flags = PF_R | PF_W | PF_X  (data lives in the same segment,
-     ; so without PF_W any write to a global faults)
+dd 7 ; p_flags (PATCHED: 5 = R|X when there are two segments, 7 if one)
 dq 0 ; p_offset
+dq 0 ; p_vaddr (PATCHED LATER)
+dq 0 ; p_paddr (PATCHED LATER)
+dq 0 ; p_filesz (PATCHED LATER)
+dq 0 ; p_memsz (PATCHED LATER)
+dq 0x1000 ; p_align
+
+; The second segment: the data half. Left as PT_NULL and only filled in if a
+; `section .data` turned up, so an image with one segment does not carry a
+; header describing a region that does not exist.
+phdr2:
+dd 0 ; p_type = PT_NULL (PATCHED to PT_LOAD)
+dd 6 ; p_flags = PF_R | PF_W -- and deliberately not PF_X
+dq 0 ; p_offset (PATCHED LATER)
 dq 0 ; p_vaddr (PATCHED LATER)
 dq 0 ; p_paddr (PATCHED LATER)
 dq 0 ; p_filesz (PATCHED LATER)
@@ -409,6 +432,7 @@ main_flow:
     mov [pc_vaddr], rax
     mov qword [out_ptr], hdr_size
     mov qword [bss_size], 0
+    mov qword [data_split], 0
     xor r11, r11 ; r11 = 0 (Pass 1 mode)
     call process_file
 
@@ -425,6 +449,7 @@ main_flow:
     mov [pc_vaddr], rax
     mov qword [out_ptr], hdr_size
     mov qword [bss_size], 0
+    mov qword [data_split], 0
     mov r11, 1 ; r11 = 1 (Pass 2 mode)
     call process_file
 
@@ -450,21 +475,58 @@ main_flow:
     mov [rdi+80], rax           ; p_vaddr
     mov [rdi+88], rax           ; p_paddr
 
-    ; p_filesz is what is in the file. p_memsz reaches past the end of the file
-    ; to cover the reservations, and the kernel zero-fills the difference --
-    ; which is the whole point: 19 MB of uninitialised globals cost nothing.
+    cmp qword [data_split], 0
+    jne .two_segments
+
+    ; ---- one segment ----
+    ; No `section .data`, so code and data are interleaved and there is nowhere
+    ; to cut. It stays RWX, and e_phnum drops to 1 rather than leaving a header
+    ; that describes a segment which does not exist. The image is byte for byte
+    ; what it always was.
     ;
-    ; With nothing reserved, p_memsz stays equal to p_filesz exactly as before,
-    ; so every program that does not use .bss produces the same bytes it did.
+    ; p_filesz is what is in the file. p_memsz reaches past the end of it to
+    ; cover the reservations, and the loader zero-fills the difference -- which
+    ; is the whole point: 19 MB of uninitialised globals cost nothing.
+    mov word [rdi+56], 1        ; e_phnum
     mov rax, [out_ptr]
-    mov [rdi+96], rax ; p_filesz offset in phdr
-    mov [rdi+104], rax ; p_memsz offset in phdr
+    mov [rdi+96], rax           ; p_filesz
+    mov [rdi+104], rax          ; p_memsz
     cmp qword [bss_size], 0
-    je .no_bss
+    je .patched
     mov rax, bss_gap
     add rax, [bss_size]
     mov [rdi+104], rax
-.no_bss:
+    jmp .patched
+
+.two_segments:
+    ; ---- two: read+execute up to the split, read+write after it ----
+    ; Nothing is both, which is the only property that matters here.
+    mov dword [rdi+68], 5       ; phdr1 p_flags = PF_R | PF_X
+    mov rax, [data_split]
+    mov [rdi+96], rax           ; phdr1 p_filesz = everything before the split
+    mov [rdi+104], rax          ; phdr1 p_memsz  = the same; code is all file
+
+    mov dword [rdi+120], 1      ; phdr2 p_type = PT_LOAD
+    mov rax, [data_split]
+    mov [rdi+128], rax          ; phdr2 p_offset
+    mov rbx, [out_base]
+    add rbx, rax
+    mov [rdi+136], rbx          ; phdr2 p_vaddr
+    mov [rdi+144], rbx          ; phdr2 p_paddr
+    mov rbx, [out_ptr]
+    sub rbx, rax
+    mov [rdi+152], rbx          ; phdr2 p_filesz = the rest of the file
+    mov [rdi+160], rbx          ; phdr2 p_memsz, unless something was reserved
+    cmp qword [bss_size], 0
+    je .patched
+    ; The .bss sits bss_gap above the base, so measured from the data segment's
+    ; own start it reaches (bss_gap - split) + bss_size. Everything between the
+    ; end of the file and there is zero-filled by the loader.
+    mov rbx, bss_gap
+    sub rbx, rax
+    add rbx, [bss_size]
+    mov [rdi+160], rbx
+.patched:
 
     ; 6. Write the output
     mov rdi, [out_path_p]
@@ -729,6 +791,36 @@ process_label:
 ; Only defined during pass 1; pass 2 would otherwise append a second copy of
 ; every symbol and overflow the table.
 ; ------------------------------------------------------------------------------
+; Pad to the next page and record where the data half of the image starts.
+;
+; The padding has to happen in BOTH passes, or they disagree about every
+; address after it -- so the count comes from pc_vaddr, which is correct in
+; both, rather than from out_ptr, which only moves in the emit pass.
+;
+; A page boundary is not decoration either. The loader maps a segment at
+; p_vaddr with the file bytes from p_offset, and the two have to be congruent
+; modulo the page size. Splitting mid-page would put one page in two segments
+; with different permissions, and whichever was mapped second would win.
+start_data_section:
+    mov rax, [pc_vaddr]
+    neg rax
+    and rax, 4095
+    mov [t_res], rax            ; how many bytes of padding
+.pad:
+    cmp qword [t_res], 0
+    je .padded
+    xor rdi, rdi
+    call emit_byte              ; emits in pass 2 only
+    inc qword [pc_vaddr]        ; but the address advances in both
+    dec qword [t_res]
+    jmp .pad
+.padded:
+    mov rax, [pc_vaddr]
+    sub rax, [code_base]
+    add rax, hdr_size           ; a file offset, not an offset into the code
+    mov [data_split], rax
+    ret
+
 ; label_name_len — length of the name at rdi, up to whitespace or end of line.
 ; Returns it in rcx, which is what add_symbol and hash_str_token expect.
 ; Shared by "name db ..." and "name resb ..." rather than written twice: two
@@ -968,7 +1060,7 @@ parse_instruction:
     mov dword [mnemonic_buf], eax   ; keep word 1 for the error message
     call is_directive
     cmp rdx, 1
-    je .skip
+    je .maybe_section
 
     mov rdi, r12                ; look at the second word
 .skip_ws:
@@ -1014,6 +1106,33 @@ parse_instruction:
     mov eax, [mnemonic_buf]
     mov dword [key_buf], eax
     jmp unknown_mnemonic
+
+.maybe_section:
+    ; Directives are ignored -- except that `section .data` marks where the
+    ; writable half of the image begins, which is the whole basis of emitting
+    ; two segments instead of one.
+    mov eax, [mnemonic_buf]
+    cmp eax, 'sect'
+    jne .skip
+    mov rdi, r12
+.sec_ws:
+    movzx rax, byte [rdi]
+    cmp al, ' '
+    je .sec_adv
+    cmp al, 9
+    je .sec_adv
+    jmp .sec_word
+.sec_adv:
+    inc rdi
+    jmp .sec_ws
+.sec_word:
+    call word_key
+    cmp eax, '.dat'
+    jne .skip
+    cmp qword [data_split], 0   ; only the FIRST one is a split
+    jne .skip
+    jmp start_data_section
+
 .skip:
     ret
 
