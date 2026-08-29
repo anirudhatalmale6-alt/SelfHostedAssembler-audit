@@ -22,6 +22,11 @@ make bootstrap  # C -> nano_cc -> mini-asm -> running binary, no gcc, no binutil
 make selfhost   # the COMPILER itself, built by mini-asm, twice, identically
 ```
 
+**And it runs on nano-os.** `tools/retarget.py` swaps the block between the
+`; ==== TARGET ... ====` markers, so one assembler body serves both Linux and
+[nano-os](https://github.com/anirudhatalmale6-alt/simpleCpp-build-fix), where it
+is `/bin/as` — see [section 12](#12-two-targets-one-assembler).
+
 **The loop closes, all the way round.** `fixed/selfContained.asm` assembles
 `nano_cc`'s own source into a working 220,794-byte compiler with no gcc and no
 binutils anywhere in the path — and that compiler, compiling itself again and
@@ -814,3 +819,84 @@ Error:
 `Error:` on its own is a fine report for a nine-line test program and useless
 for a 39,000-line one. Both error paths now print the source line the read
 pointer is in. Nothing else in this section would have been findable without it.
+
+---
+
+## 12. Two targets, one assembler
+
+Everything the assembler needs from the operating system it **runs on** lives
+between two marker lines:
+
+```
+; ==== TARGET BEGIN ====
+...
+; ==== TARGET END ====
+```
+
+`tools/retarget.py` swaps that block. `fixed/selfContained.asm` carries the
+Linux one inline and is still a complete, buildable file;
+`fixed/target-nanoos.inc` is the other, and the body underneath is the same
+assembler either way. That is deliberate: two copies of a 2,300-line assembler
+drift, and a divergence between them shows up as a miscompilation on one
+platform and not the other, which is close to the worst shape a bug can have.
+
+The block is four routines and one constant — `os_read_input`,
+`os_write_output`, `os_err`, `os_exit`, and `def_base`. Nothing outside it
+issues a syscall or knows a syscall number.
+
+### Two axes, and they are not the same axis
+
+Which OS the assembler runs on has nothing to do with which base address it
+**emits for**. The second is now a `-b` flag rather than an assemble-time
+constant, and separating them is what makes building a nano-os assembler on
+Linux possible at all: the Linux build, told `-b 0x8000000000`, produces the
+nano-os binary.
+
+```
+mini_asm [input.asm [output]] [-b BASE]
+```
+
+With no arguments it behaves exactly as it always did — `selfHosted.asm` in,
+`a.out` out, linked at `0x400000` — which is why every existing test still
+passes unchanged.
+
+### `int N`
+
+`CD ib`, byte-identical to GNU as. Without it the assembler could emit
+`syscall` and not `int 0x80`, so it could build programs for exactly one of the
+two operating systems it now runs on. An operand outside 0..255 is refused
+rather than truncated.
+
+### The bug that only appears above 2 GiB
+
+The first program built this way called `main` and landed fifteen bytes short of
+it, in the middle of an instruction.
+
+`mov reg, imm` is seven bytes when the value fits in a signed 32-bit field and
+ten when it does not. A forward reference is unknown during the sizing pass, so
+the placeholder was **zero** and the short form was sized; the emit pass knew
+the real address and emitted the long one. Every label after that point was off
+by three bytes per occurrence.
+
+It had never happened at `0x400000` because there the placeholder and the real
+address are in the same size class. At 512 GiB neither is. The placeholder is
+now `out_base`, the lowest address any symbol can have.
+
+**The assembler now also checks that the two passes agree on the total size:**
+
+```
+Error: the two passes disagree about the size of the output
+```
+
+That is the more important half. The divergence did not produce a
+broken-looking binary — it produced a plausible one, of the right size, that ran
+until it jumped into the middle of an instruction, and nothing was watching for
+it.
+
+### Addressing
+
+`mov rsi, in_buf` encodes the symbol as a 32-bit absolute, which ld refuses at
+512 GiB. Thirty-four of those became `lea rsi, [rip + in_buf]`, and six
+`[symbol + register]` forms became a RIP-relative `lea` plus an `add`. Also:
+`mov qword [out_base], def_base` stores a 32-bit immediate, which is right at
+`0x400000` and quietly a different number at `0x8000000000`.
